@@ -1,79 +1,147 @@
-import { redisConnection } from "../config/redis.js";
+import {
+	redisConnection
+} from "../config/redis.js";
+
+
+/*
+|--------------------------------------------------------------------------
+| Normalize Chat ID
+|--------------------------------------------------------------------------
+*/
 
 function normalizeChatId(chatId) {
+
 	return chatId.replace(
 		/[^a-zA-Z0-9]/g,
 		"_"
 	);
+
 }
 
-function sequenceKey(chatId) {
-	return `chat:sequence:${normalizeChatId(chatId)}`;
-}
-
-function expectedKey(chatId) {
-	return `chat:expected:${normalizeChatId(chatId)}`;
-}
-
-function lockKey(chatId) {
-	return `chat:lock:${normalizeChatId(chatId)}`;
-}
 
 /*
 |--------------------------------------------------------------------------
-| SEQUENCE
+| Redis Keys
 |--------------------------------------------------------------------------
 */
 
-export async function getNextSequence(chatId) {
+function sequenceKey(chatId) {
+
+	return (
+		`chat:sequence:` +
+		normalizeChatId(chatId)
+	);
+
+}
+
+
+function expectedKey(chatId) {
+
+	return (
+		`chat:expected:` +
+		normalizeChatId(chatId)
+	);
+
+}
+
+
+function lockKey(chatId) {
+
+	return (
+		`chat:lock:` +
+		normalizeChatId(chatId)
+	);
+
+}
+
+
+/*
+|--------------------------------------------------------------------------
+| Get Next Sequence
+|--------------------------------------------------------------------------
+*/
+
+export async function getNextSequence(
+	chatId
+) {
+
 	return await redisConnection.incr(
 		sequenceKey(chatId)
 	);
+
 }
+
 
 /*
 |--------------------------------------------------------------------------
-| EXPECTED SEQUENCE
+| Get Expected Sequence
 |--------------------------------------------------------------------------
 */
 
-export async function getExpectedSequence(chatId) {
+export async function getExpectedSequence(
+	chatId
+) {
+
 	const value =
 		await redisConnection.get(
 			expectedKey(chatId)
 		);
 
+
 	if (!value) {
+
 		return 1;
+
 	}
 
+
 	return Number(value);
+
 }
+
 
 /*
 |--------------------------------------------------------------------------
-| CLAIM SEQUENCE
+| Claim Sequence
 |--------------------------------------------------------------------------
 |
-| Sequence hanya boleh diproses jika:
+| Atomic operation:
 |
-| expected == sequence
+| 1. Pastikan expected tersedia.
+| 2. Pastikan sequence sesuai expected.
+| 3. Ambil lock.
 |
-| dan lock chat belum digunakan.
-|
+|--------------------------------------------------------------------------
 */
 
 const claimSequenceScript = `
+
 local expected =
-	redis.call("GET", KEYS[1])
+	redis.call(
+		"GET",
+		KEYS[1]
+	)
 
 if not expected then
+
 	expected = "1"
+
+	redis.call(
+		"SET",
+		KEYS[1],
+		expected
+	)
+
 end
 
-if tonumber(expected) ~= tonumber(ARGV[1]) then
+
+if tonumber(expected)
+	~= tonumber(ARGV[1]) then
+
 	return 0
+
 end
+
 
 local result =
 	redis.call(
@@ -85,50 +153,106 @@ local result =
 		ARGV[3]
 	)
 
+
 if result then
+
 	return 1
+
 end
 
+
 return 0
+
 `;
 
+
 export async function claimSequence(
+
 	chatId,
+
 	sequence,
+
 	workerId,
+
 	lockTtl = 300
+
 ) {
+
 	const result =
 		await redisConnection.eval(
+
 			claimSequenceScript,
+
 			2,
+
 			expectedKey(chatId),
+
 			lockKey(chatId),
+
 			sequence,
+
 			workerId,
+
 			lockTtl
+
 		);
 
-	return result === 1;
+
+	const claimed =
+		result === 1;
+
+
+	if (claimed) {
+
+		console.log(
+			`[Ordering] Sequence ${sequence} claimed`
+		);
+
+	}
+
+
+	return claimed;
+
 }
+
 
 /*
 |--------------------------------------------------------------------------
-| ADVANCE SEQUENCE
+| Advance Sequence
+|--------------------------------------------------------------------------
+|
+| expected:
+|
+| 1 → 2
+| 2 → 3
+| 3 → 4
+|
 |--------------------------------------------------------------------------
 */
 
 const advanceSequenceScript = `
+
 local expected =
-	redis.call("GET", KEYS[1])
+	redis.call(
+		"GET",
+		KEYS[1]
+	)
+
 
 if not expected then
+
 	return 0
+
 end
 
-if tonumber(expected) ~= tonumber(ARGV[1]) then
+
+if tonumber(expected)
+	~= tonumber(ARGV[1]) then
+
 	return 0
+
 end
+
 
 redis.call(
 	"SET",
@@ -136,83 +260,160 @@ redis.call(
 	tonumber(ARGV[1]) + 1
 )
 
+
 return 1
+
 `;
 
+
 export async function advanceSequence(
+
 	chatId,
+
 	sequence
+
 ) {
+
 	const result =
 		await redisConnection.eval(
+
 			advanceSequenceScript,
+
 			1,
+
 			expectedKey(chatId),
+
 			sequence
+
 		);
 
-	return result === 1;
+
+	const advanced =
+		result === 1;
+
+
+	if (advanced) {
+
+		console.log(
+			`[Ordering] Sequence ${sequence} advanced`
+		);
+
+	}
+
+
+	return advanced;
+
 }
+
 
 /*
 |--------------------------------------------------------------------------
-| RELEASE LOCK
+| Release Lock
+|--------------------------------------------------------------------------
+|
+| Hanya worker pemilik lock yang boleh menghapus lock.
 |--------------------------------------------------------------------------
 */
 
 const releaseLockScript = `
+
 local current =
-	redis.call("GET", KEYS[1])
+	redis.call(
+		"GET",
+		KEYS[1]
+	)
+
 
 if current == ARGV[1] then
+
 	return redis.call(
 		"DEL",
 		KEYS[1]
 	)
+
 end
 
+
 return 0
+
 `;
 
+
 export async function releaseChatLock(
+
 	chatId,
+
 	workerId
+
 ) {
+
 	const result =
 		await redisConnection.eval(
+
 			releaseLockScript,
+
 			1,
+
 			lockKey(chatId),
+
 			workerId
+
 		);
 
-	return result === 1;
+
+	const released =
+		result === 1;
+
+
+	console.log(
+		`[Ordering] Lock released: ${released}`
+	);
+
+
+	return released;
+
 }
+
 
 /*
 |--------------------------------------------------------------------------
-| SKIP FAILED SEQUENCE
+| Skip Sequence
 |--------------------------------------------------------------------------
 |
-| Hanya digunakan jika:
-| - processing benar-benar gagal
-| - retry sudah habis
-|
-| JANGAN digunakan untuk MESSAGE_ORDER_WAIT.
-|
+| Digunakan hanya jika job benar-benar gagal
+| setelah seluruh retry BullMQ habis.
+|--------------------------------------------------------------------------
 */
 
 const skipSequenceScript = `
+
 local expected =
-	redis.call("GET", KEYS[1])
+	redis.call(
+		"GET",
+		KEYS[1]
+	)
+
 
 if not expected then
+
 	expected = "1"
+
+	redis.call(
+		"SET",
+		KEYS[1],
+		expected
+	)
+
 end
 
-if tonumber(expected) ~= tonumber(ARGV[1]) then
+
+if tonumber(expected)
+	~= tonumber(ARGV[1]) then
+
 	return 0
+
 end
+
 
 redis.call(
 	"SET",
@@ -220,20 +421,47 @@ redis.call(
 	tonumber(ARGV[1]) + 1
 )
 
+
 return 1
+
 `;
 
+
 export async function skipSequence(
+
 	chatId,
+
 	sequence
+
 ) {
+
 	const result =
 		await redisConnection.eval(
+
 			skipSequenceScript,
+
 			1,
+
 			expectedKey(chatId),
+
 			sequence
+
 		);
 
-	return result === 1;
+
+	const skipped =
+		result === 1;
+
+
+	if (skipped) {
+
+		console.log(
+			`[Ordering] Skipping sequence ${sequence}`
+		);
+
+	}
+
+
+	return skipped;
+
 }
